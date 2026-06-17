@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+calorie_calc.py - Калькулятор калорий на Python (CLI + Tkinter GUI)
+Поддерживает формулы Mifflin-St Jeor и Harris-Benedict, учёт активности, цели.
+"""
+import argparse
+import sys
+import json
+import os
+from math import isnan
+from typing import Optional, Tuple, Dict
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, scrolledtext
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+
+# ========== КОНСТАНТЫ ==========
+ACTIVITY_LEVELS = {
+    'sedentary': 1.2,
+    'light': 1.375,
+    'moderate': 1.55,
+    'active': 1.725,
+    'very_active': 1.9,
+}
+ACTIVITY_NAMES = {
+    'sedentary': 'Сидячий образ жизни',
+    'light': 'Лёгкая активность (1-3 дня/нед)',
+    'moderate': 'Умеренная активность (3-5 дней/нед)',
+    'active': 'Высокая активность (6-7 дней/нед)',
+    'very_active': 'Очень высокая активность (тяжёлая работа/спорт)',
+}
+GOALS = ['maintain', 'lose', 'gain']
+GOAL_NAMES = {
+    'maintain': 'Поддержание веса',
+    'lose': 'Похудение (дефицит 15%)',
+    'gain': 'Набор массы (профицит 15%)',
+}
+GENDER_NAMES = {'male': 'Мужской', 'female': 'Женский'}
+
+# ========== ФУНКЦИИ РАСЧЁТА ==========
+def bmr_mifflin_st_jeor(gender: str, age: float, height: float, weight: float) -> float:
+    """Mifflin-St Jeor BMR (возраст в годах, рост в см, вес в кг)"""
+    if gender == 'male':
+        return 10 * weight + 6.25 * height - 5 * age + 5
+    else:
+        return 10 * weight + 6.25 * height - 5 * age - 161
+
+def bmr_harris_benedict(gender: str, age: float, height: float, weight: float) -> float:
+    """Harris-Benedict (пересмотренная) BMR (возраст в годах, рост в см, вес в кг)"""
+    if gender == 'male':
+        return 88.362 + 13.397 * weight + 4.799 * height - 5.677 * age
+    else:
+        return 447.593 + 9.247 * weight + 3.098 * height - 4.330 * age
+
+def calculate_tdee(bmr: float, activity: str) -> float:
+    return bmr * ACTIVITY_LEVELS[activity]
+
+def calculate_goal_calories(tdee: float, goal: str) -> float:
+    if goal == 'maintain':
+        return tdee
+    elif goal == 'lose':
+        return tdee * 0.85  # дефицит 15%
+    elif goal == 'gain':
+        return tdee * 1.15  # профицит 15%
+    else:
+        return tdee
+
+def calculate_macros(calories: float, goal: str) -> Dict[str, float]:
+    """Расчёт белков, жиров, углеводов (в граммах)"""
+    # Приоритет: белок ~30%, жиры ~25%, углеводы ~45%
+    protein_ratio = 0.30
+    fat_ratio = 0.25
+    carb_ratio = 0.45
+    if goal == 'lose':
+        protein_ratio = 0.35
+        fat_ratio = 0.25
+        carb_ratio = 0.40
+    elif goal == 'gain':
+        protein_ratio = 0.30
+        fat_ratio = 0.20
+        carb_ratio = 0.50
+    protein = (calories * protein_ratio) / 4  # 4 ккал на грамм белка
+    fat = (calories * fat_ratio) / 9          # 9 ккал на грамм жира
+    carbs = (calories * carb_ratio) / 4       # 4 ккал на грамм углеводов
+    return {'protein': protein, 'fat': fat, 'carbs': carbs}
+
+def generate_report(params: Dict, bmr: float, tdee: float, goal_cal: float, macros: Dict) -> str:
+    lines = []
+    lines.append("=" * 50)
+    lines.append("📋 ОТЧЁТ ПО КАЛОРИЯМ")
+    lines.append("=" * 50)
+    lines.append(f"Пол: {GENDER_NAMES[params['gender']]}")
+    lines.append(f"Возраст: {params['age']} лет")
+    lines.append(f"Рост: {params['height']} см")
+    lines.append(f"Вес: {params['weight']} кг")
+    lines.append(f"Уровень активности: {ACTIVITY_NAMES[params['activity']]}")
+    lines.append(f"Цель: {GOAL_NAMES[params['goal']]}")
+    lines.append("-" * 50)
+    lines.append(f"BMR (базовый метаболизм): {bmr:.1f} ккал/день")
+    lines.append(f"TDEE (суточная норма): {tdee:.1f} ккал/день")
+    lines.append(f"Рекомендуемая калорийность для цели: {goal_cal:.1f} ккал/день")
+    lines.append("-" * 50)
+    lines.append("🍽️ РАСПРЕДЕЛЕНИЕ ПО МАКРОНУТРИЕНТАМ:")
+    lines.append(f"Белки: {macros['protein']:.1f} г ({(macros['protein']*4/goal_cal*100):.0f}%)")
+    lines.append(f"Жиры: {macros['fat']:.1f} г ({(macros['fat']*9/goal_cal*100):.0f}%)")
+    lines.append(f"Углеводы: {macros['carbs']:.1f} г ({(macros['carbs']*4/goal_cal*100):.0f}%)")
+    lines.append("=" * 50)
+    return "\n".join(lines)
+
+# ========== CLI ==========
+def cli():
+    parser = argparse.ArgumentParser(description="Калькулятор калорий")
+    parser.add_argument("--gender", choices=['male','female'], required=True, help="Пол")
+    parser.add_argument("--age", type=float, required=True, help="Возраст (лет)")
+    parser.add_argument("--height", type=float, help="Рост (см) для метрической системы")
+    parser.add_argument("--height-ft", type=int, help="Рост (футы) для имперской системы")
+    parser.add_argument("--height-in", type=int, default=0, help="Рост (дюймы) для имперской системы")
+    parser.add_argument("--weight", type=float, help="Вес (кг) для метрической системы")
+    parser.add_argument("--weight-lb", type=float, help="Вес (фунты) для имперской системы")
+    parser.add_argument("--activity", choices=list(ACTIVITY_LEVELS.keys()), required=True, help="Уровень активности")
+    parser.add_argument("--goal", choices=GOALS, default='maintain', help="Цель")
+    parser.add_argument("--formula", choices=['msj','hb'], default='msj', help="Формула BMR")
+    parser.add_argument("--output", "-o", help="Сохранить отчёт в файл (TXT)")
+    parser.add_argument("--gui", action="store_true", help="Запустить GUI")
+    args = parser.parse_args()
+
+    if args.gui and GUI_AVAILABLE:
+        root = tk.Tk()
+        app = CalorieGUI(root)
+        root.mainloop()
+        return
+
+    # Преобразование единиц
+    height = args.height
+    weight = args.weight
+    if args.height_ft is not None:
+        height = args.height_ft * 30.48 + args.height_in * 2.54
+    if args.weight_lb is not None:
+        weight = args.weight_lb * 0.453592
+    if height is None or weight is None:
+        print("Укажите рост и вес (метрические или имперские)")
+        return
+
+    params = {
+        'gender': args.gender,
+        'age': args.age,
+        'height': height,
+        'weight': weight,
+        'activity': args.activity,
+        'goal': args.goal,
+        'formula': args.formula,
+    }
+
+    # Расчёт
+    if args.formula == 'msj':
+        bmr = bmr_mifflin_st_jeor(args.gender, args.age, height, weight)
+    else:
+        bmr = bmr_harris_benedict(args.gender, args.age, height, weight)
+    tdee = calculate_tdee(bmr, args.activity)
+    goal_cal = calculate_goal_calories(tdee, args.goal)
+    macros = calculate_macros(goal_cal, args.goal)
+
+    report = generate_report(params, bmr, tdee, goal_cal, macros)
+    print(report)
+
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(report)
+        print(f"Отчёт сохранён в {args.output}")
+
+# ========== GUI ==========
+if GUI_AVAILABLE:
+    class CalorieGUI:
+        def __init__(self, root):
+            self.root = root
+            self.root.title("Калькулятор калорий")
+            self.root.geometry("600x700")
+            self.root.resizable(False, False)
+
+            self.gender = tk.StringVar(value='male')
+            self.age = tk.StringVar()
+            self.height = tk.StringVar()
+            self.weight = tk.StringVar()
+            self.activity = tk.StringVar(value='moderate')
+            self.goal = tk.StringVar(value='maintain')
+            self.formula = tk.StringVar(value='msj')
+
+            self.create_widgets()
+
+        def create_widgets(self):
+            main = ttk.Frame(self.root, padding="10")
+            main.pack(fill=tk.BOTH, expand=True)
+
+            row = 0
+            # Пол
+            ttk.Label(main, text="Пол:").grid(row=row, column=0, sticky="w", pady=5)
+            gender_frame = ttk.Frame(main)
+            gender_frame.grid(row=row, column=1, sticky="w", pady=5)
+            ttk.Radiobutton(gender_frame, text="Мужской", variable=self.gender, value='male').pack(side=tk.LEFT)
+            ttk.Radiobutton(gender_frame, text="Женский", variable=self.gender, value='female').pack(side=tk.LEFT)
+            row += 1
+
+            # Возраст
+            ttk.Label(main, text="Возраст (лет):").grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(main, textvariable=self.age, width=10).grid(row=row, column=1, sticky="w", pady=5)
+            row += 1
+
+            # Рост
+            ttk.Label(main, text="Рост (см):").grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(main, textvariable=self.height, width=10).grid(row=row, column=1, sticky="w", pady=5)
+            row += 1
+
+            # Вес
+            ttk.Label(main, text="Вес (кг):").grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(main, textvariable=self.weight, width=10).grid(row=row, column=1, sticky="w", pady=5)
+            row += 1
+
+            # Активность
+            ttk.Label(main, text="Уровень активности:").grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Combobox(main, textvariable=self.activity, values=list(ACTIVITY_LEVELS.keys()), state="readonly").grid(row=row, column=1, sticky="w", pady=5)
+            row += 1
+
+            # Цель
+            ttk.Label(main, text="Цель:").grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Combobox(main, textvariable=self.goal, values=GOALS, state="readonly").grid(row=row, column=1, sticky="w", pady=5)
+            row += 1
+
+            # Формула
+            ttk.Label(main, text="Формула BMR:").grid(row=row, column=0, sticky="w", pady=5)
+            formula_frame = ttk.Frame(main)
+            formula_frame.grid(row=row, column=1, sticky="w", pady=5)
+            ttk.Radiobutton(formula_frame, text="Mifflin-St Jeor", variable=self.formula, value='msj').pack(side=tk.LEFT)
+            ttk.Radiobutton(formula_frame, text="Harris-Benedict", variable=self.formula, value='hb').pack(side=tk.LEFT)
+            row += 1
+
+            # Кнопка
+            ttk.Button(main, text="Рассчитать", command=self.calculate).grid(row=row, column=0, columnspan=2, pady=10)
+            row += 1
+
+            # Результат
+            self.result_text = scrolledtext.ScrolledText(main, height=15, width=60)
+            self.result_text.grid(row=row, column=0, columnspan=2, pady=5)
+            row += 1
+
+            # Кнопки сохранения
+            btn_frame = ttk.Frame(main)
+            btn_frame.grid(row=row, column=0, columnspan=2, pady=5)
+            ttk.Button(btn_frame, text="Сохранить в файл", command=self.save_result).pack(side=tk.LEFT, padx=5)
+            ttk.Button(btn_frame, text="Очистить", command=self.clear).pack(side=tk.LEFT, padx=5)
+
+        def calculate(self):
+            try:
+                age = float(self.age.get())
+                height = float(self.height.get())
+                weight = float(self.weight.get())
+                gender = self.gender.get()
+                activity = self.activity.get()
+                goal = self.goal.get()
+                formula = self.formula.get()
+                if formula == 'msj':
+                    bmr = bmr_mifflin_st_jeor(gender, age, height, weight)
+                else:
+                    bmr = bmr_harris_benedict(gender, age, height, weight)
+                tdee = calculate_tdee(bmr, activity)
+                goal_cal = calculate_goal_calories(tdee, goal)
+                macros = calculate_macros(goal_cal, goal)
+                params = {
+                    'gender': gender,
+                    'age': age,
+                    'height': height,
+                    'weight': weight,
+                    'activity': activity,
+                    'goal': goal,
+                    'formula': formula,
+                }
+                report = generate_report(params, bmr, tdee, goal_cal, macros)
+                self.result_text.delete(1.0, tk.END)
+                self.result_text.insert(tk.END, report)
+            except ValueError:
+                messagebox.showerror("Ошибка", "Введите корректные числа")
+
+        def save_result(self):
+            content = self.result_text.get(1.0, tk.END).strip()
+            if not content:
+                messagebox.showwarning("Нет данных", "Сначала рассчитайте результат")
+                return
+            filepath = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
+            if filepath:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                messagebox.showinfo("Сохранено", "Отчёт сохранён")
+
+        def clear(self):
+            self.result_text.delete(1.0, tk.END)
+            self.age.set("")
+            self.height.set("")
+            self.weight.set("")
+
+if __name__ == "__main__":
+    cli()
